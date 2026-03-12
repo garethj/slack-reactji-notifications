@@ -28,7 +28,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     workspacesEl.innerHTML = workspaces.map(ws => {
       const statusLabels = {
         connected: 'Connected',
-        'no-tab': 'Slack not open',
+        'no-cookie': 'Session expired — open app.slack.com',
         'token-expired': 'Token expired — re-login to Slack',
         'rate-limited': 'Rate limited — backing off',
         error: ws.lastError || 'Error'

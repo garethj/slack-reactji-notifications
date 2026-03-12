@@ -1,12 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Slack Reactji Notifications",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Get macOS notifications when someone reacts to your Slack messages",
   "permissions": [
     "notifications",
     "storage",
-    "alarms"
+    "alarms",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://*.slack.com/*",
+    "https://slack.com/*"
   ],
   "background": {
     "service_worker": "background.js"

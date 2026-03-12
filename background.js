@@ -1,9 +1,39 @@
 // Service worker — handles alarms, diffing, notifications, state
+// Makes Slack API calls directly using stored tokens + d cookie via chrome.cookies
 
 const ALARM_NAME = 'poll-reactions';
 const DEFAULT_POLL_INTERVAL = 2; // minutes
 const MAX_RECENT_REACTIONS = 50;
 const PRUNE_AGE_DAYS = 7;
+const PRUNE_AGE_MS = PRUNE_AGE_DAYS * 86400000;
+
+// ── Slack API helper ──
+
+async function getSlackCookie() {
+  const cookie = await chrome.cookies.get({ url: 'https://app.slack.com', name: 'd' });
+  return cookie?.value || null;
+}
+
+async function slackApi(method, token, params = {}) {
+  const cookieValue = await getSlackCookie();
+  if (!cookieValue) {
+    return { ok: false, error: 'no_cookie' };
+  }
+
+  const body = new URLSearchParams({ token, ...params });
+  // credentials: 'include' tells the browser to attach cookies from its jar
+  // for the target domain (including the HttpOnly 'd' cookie).
+  // Manually setting Cookie header doesn't work — it's a forbidden header in fetch().
+  const res = await fetch(`https://slack.com/api/${method}`, {
+    method: 'POST',
+    body,
+    credentials: 'include'
+  });
+  if (!res.ok) {
+    return { ok: false, error: `http_${res.status}` };
+  }
+  return res.json();
+}
 
 // ── Alarm setup ──
 
@@ -29,7 +59,7 @@ chrome.runtime.onStartup.addListener(async () => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'workspaces-found') {
-    handleWorkspacesFound(msg.workspaces, sender.tab?.id);
+    handleWorkspacesFound(msg.workspaces);
   }
 
   if (msg.type === 'poll-now') {
@@ -55,6 +85,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ── Notification click ──
 
 chrome.notifications.onClicked.addListener(async notificationId => {
+  if (notificationId === 'disconnected') return;
   const { recentReactions } = await chrome.storage.local.get('recentReactions');
   const reaction = (recentReactions || []).find(r => r.id === notificationId);
   if (reaction?.permalink) {
@@ -65,7 +96,7 @@ chrome.notifications.onClicked.addListener(async notificationId => {
 
 // ── Core logic ──
 
-async function handleWorkspacesFound(workspaces, tabId) {
+async function handleWorkspacesFound(workspaces) {
   const data = await chrome.storage.local.get('workspaces');
   const stored = data.workspaces || {};
 
@@ -75,168 +106,209 @@ async function handleWorkspacesFound(workspaces, tabId) {
       teamName: ws.teamName,
       teamUrl: ws.teamUrl,
       userId: ws.userId,
-      tabId,
-      status: 'connected',
-      knownReactions: stored[ws.teamId]?.knownReactions || {}
+      token: ws.token,
+      status: 'connected'
     };
   }
 
   await chrome.storage.local.set({ workspaces: stored });
 }
 
-async function findSlackTab() {
+async function refreshTokensFromTab() {
   const tabs = await chrome.tabs.query({ url: 'https://app.slack.com/*' });
-  return tabs[0] || null;
+  if (!tabs.length) return false;
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabs[0].id, { type: 'extract-tokens' });
+    if (response?.workspaces?.length) {
+      await handleWorkspacesFound(response.workspaces);
+      return true;
+    }
+  } catch (e) {
+    // Content script not reachable — tab might be loading
+  }
+  return false;
 }
 
 async function pollAllWorkspaces() {
-  const data = await chrome.storage.local.get(['workspaces', 'settings', 'recentReactions', 'userNameCache']);
+  const data = await chrome.storage.local.get([
+    'workspaces', 'settings', 'recentReactions', 'userNameCache',
+    'notifiedReactions', 'wasConnected'
+  ]);
   const workspaces = data.workspaces || {};
   const settings = data.settings || {};
   const maxMessages = settings.maxMessagesToCheck || 20;
   const notificationsEnabled = settings.notificationsEnabled !== false;
   let recentReactions = data.recentReactions || [];
   let userNameCache = data.userNameCache || {};
+  let notifiedReactions = data.notifiedReactions || {};
+  let wasConnected = data.wasConnected !== false; // default true to avoid notifying on first install
 
-  const slackTab = await findSlackTab();
-  if (!slackTab) {
-    // No Slack tab — set badge indicator
+  // Try to refresh tokens from a Slack tab if one is open
+  await refreshTokensFromTab();
+
+  // Re-read workspaces in case tokens were refreshed
+  const freshData = await chrome.storage.local.get('workspaces');
+  const freshWorkspaces = freshData.workspaces || {};
+
+  // Check if we have any workspaces with tokens
+  const workspaceEntries = Object.entries(freshWorkspaces).filter(([, ws]) => ws.token);
+  if (!workspaceEntries.length) {
     chrome.action.setBadgeText({ text: '!' });
     chrome.action.setBadgeBackgroundColor({ color: '#ff9800' });
 
-    // Mark all workspaces as no-tab
-    for (const teamId of Object.keys(workspaces)) {
-      workspaces[teamId].status = 'no-tab';
+    // Notify on transition to disconnected
+    if (wasConnected) {
+      chrome.notifications.create('disconnected', {
+        type: 'basic',
+        iconUrl: 'icons/icon128.png',
+        title: 'Slack Reactji: Not connected',
+        message: 'Open app.slack.com and sign in to enable reaction notifications.',
+        priority: 1
+      });
     }
-    await chrome.storage.local.set({ workspaces, lastPollTime: Date.now(), lastPollError: 'No Slack tab open' });
+
+    await chrome.storage.local.set({
+      lastPollTime: Date.now(),
+      lastPollError: 'No workspaces connected. Open app.slack.com to set up.',
+      wasConnected: false
+    });
     return;
   }
 
-  // First extract fresh tokens
-  let tokensResponse;
-  try {
-    tokensResponse = await chrome.tabs.sendMessage(slackTab.id, { type: 'extract-tokens' });
-  } catch (e) {
+  // Check we have the d cookie
+  const cookieValue = await getSlackCookie();
+  if (!cookieValue) {
     chrome.action.setBadgeText({ text: '!' });
-    chrome.action.setBadgeBackgroundColor({ color: '#f44336' });
-    await chrome.storage.local.set({ lastPollTime: Date.now(), lastPollError: 'Cannot reach Slack tab' });
+    chrome.action.setBadgeBackgroundColor({ color: '#ff9800' });
+
+    if (wasConnected) {
+      chrome.notifications.create('disconnected', {
+        type: 'basic',
+        iconUrl: 'icons/icon128.png',
+        title: 'Slack Reactji: Session expired',
+        message: 'Open app.slack.com to refresh your session.',
+        priority: 1
+      });
+    }
+
+    for (const [teamId] of workspaceEntries) {
+      freshWorkspaces[teamId].status = 'no-cookie';
+    }
+    await chrome.storage.local.set({
+      workspaces: freshWorkspaces,
+      lastPollTime: Date.now(),
+      lastPollError: 'Slack session cookie missing. Open app.slack.com to refresh.',
+      wasConnected: false
+    });
     return;
   }
 
-  if (tokensResponse?.error || !tokensResponse?.workspaces?.length) {
-    await chrome.storage.local.set({ lastPollTime: Date.now(), lastPollError: 'No tokens found' });
-    return;
-  }
-
+  let anySuccess = false;
   let newReactionCount = 0;
 
-  for (const ws of tokensResponse.workspaces) {
-    const teamId = ws.teamId;
-    if (!workspaces[teamId]) {
-      workspaces[teamId] = { knownReactions: {} };
-    }
-    workspaces[teamId].teamName = ws.teamName;
-    workspaces[teamId].teamUrl = ws.teamUrl;
-    workspaces[teamId].userId = ws.userId;
-    workspaces[teamId].tabId = slackTab.id;
-    workspaces[teamId].status = 'connected';
+  for (const [teamId, ws] of workspaceEntries) {
+    // Search for recent messages with reactions
+    const searchResult = await slackApi('search.messages', ws.token, {
+      query: 'has:reaction from:me',
+      count: String(maxMessages),
+      sort: 'timestamp',
+      sort_dir: 'desc'
+    });
 
-    // Poll reactions via content script
-    let pollResult;
-    try {
-      pollResult = await chrome.tabs.sendMessage(slackTab.id, {
-        type: 'poll-reactions',
-        token: ws.token,
-        userId: ws.userId,
-        maxMessages
-      });
-    } catch (e) {
-      workspaces[teamId].status = 'error';
-      workspaces[teamId].lastError = e.message;
-      continue;
-    }
-
-    if (!pollResult?.ok) {
-      if (pollResult?.error === 'invalid_auth' || pollResult?.error === 'token_revoked') {
-        workspaces[teamId].status = 'token-expired';
-      } else if (pollResult?.error === 'ratelimited') {
-        workspaces[teamId].status = 'rate-limited';
-        // Back off: double the alarm interval temporarily
+    if (!searchResult.ok) {
+      if (searchResult.error === 'invalid_auth' || searchResult.error === 'token_revoked') {
+        freshWorkspaces[teamId].status = 'token-expired';
+        freshWorkspaces[teamId].token = null; // Clear bad token
+      } else if (searchResult.error === 'ratelimited') {
+        freshWorkspaces[teamId].status = 'rate-limited';
         const currentInterval = settings.pollIntervalMinutes || DEFAULT_POLL_INTERVAL;
         chrome.alarms.create(ALARM_NAME, { periodInMinutes: currentInterval * 2 });
         setTimeout(() => {
           chrome.alarms.create(ALARM_NAME, { periodInMinutes: currentInterval });
         }, currentInterval * 2 * 60 * 1000);
+      } else if (searchResult.error === 'no_cookie') {
+        freshWorkspaces[teamId].status = 'no-cookie';
       } else {
-        workspaces[teamId].status = 'error';
-        workspaces[teamId].lastError = pollResult?.error || 'Unknown error';
+        freshWorkspaces[teamId].status = 'error';
+        freshWorkspaces[teamId].lastError = searchResult.error || 'Unknown error';
       }
       continue;
     }
 
-    // Diff reactions
-    const known = workspaces[teamId].knownReactions || {};
+    anySuccess = true;
+    freshWorkspaces[teamId].status = 'connected';
+    freshWorkspaces[teamId].lastError = null;
+
+    const messages = searchResult.messages?.matches || [];
     const unknownUserIds = new Set();
 
-    for (const [msgKey, msgData] of Object.entries(pollResult.reactions)) {
-      if (!known[msgKey]) known[msgKey] = {};
+    for (const msg of messages) {
+      const channel = msg.channel?.id;
+      const ts = msg.ts;
+      if (!channel || !ts) continue;
 
-      for (const reaction of msgData.reactions) {
-        if (!known[msgKey][reaction.name]) known[msgKey][reaction.name] = [];
+      // Skip messages older than 7 days
+      const msgAge = Date.now() - (parseFloat(ts) * 1000);
+      if (msgAge > PRUNE_AGE_MS) continue;
 
-        const knownUsers = new Set(known[msgKey][reaction.name]);
-        const newUsers = reaction.users.filter(u => !knownUsers.has(u) && u !== ws.userId);
+      const reactionsResult = await slackApi('reactions.get', ws.token, {
+        channel,
+        timestamp: ts,
+        full: 'true'
+      });
 
-        for (const userId of newUsers) {
+      if (!reactionsResult.ok || !reactionsResult.message?.reactions) continue;
+
+      const channelName = msg.channel?.name || 'unknown';
+      const messageText = (msg.text || '').substring(0, 100);
+      const permalink = msg.permalink || '';
+
+      for (const reaction of reactionsResult.message.reactions) {
+        for (const userId of (reaction.users || [])) {
+          // if (userId === ws.userId) continue; // Skip self-reactions — disabled for testing
+
+          const reactionKey = `${channel}_${ts}_${reaction.name}_${userId}`;
+
+          if (notifiedReactions[reactionKey]) continue; // Already notified
+
+          // Collect unknown user IDs for name resolution
           if (!userNameCache[userId] || (Date.now() - (userNameCache[userId + '_ts'] || 0)) > 86400000) {
             unknownUserIds.add(userId);
           }
-        }
 
-        if (newUsers.length > 0) {
-          known[msgKey][reaction.name] = reaction.users;
+          // Mark as notified
+          notifiedReactions[reactionKey] = Date.now();
+          newReactionCount++;
 
-          for (const userId of newUsers) {
-            newReactionCount++;
-            const reactionEntry = {
-              id: `${teamId}_${msgKey}_${reaction.name}_${userId}_${Date.now()}`,
-              teamId,
-              teamName: ws.teamName,
-              channel: msgData.channelName,
-              messageText: msgData.messageText,
-              permalink: msgData.permalink,
-              reactionName: reaction.name,
-              reactorId: userId,
-              reactorName: null, // resolved below
-              timestamp: Date.now()
-            };
-            recentReactions.unshift(reactionEntry);
-          }
-        } else {
-          // Update known users even if no new ones (handles removed reactions)
-          known[msgKey][reaction.name] = reaction.users;
+          const reactionEntry = {
+            id: `${teamId}_${reactionKey}_${Date.now()}`,
+            teamId,
+            teamName: ws.teamName,
+            channel: channelName,
+            messageText,
+            permalink,
+            reactionName: reaction.name,
+            reactorId: userId,
+            reactorName: null, // resolved below
+            timestamp: Date.now()
+          };
+          recentReactions.unshift(reactionEntry);
         }
       }
     }
 
-    workspaces[teamId].knownReactions = known;
-
     // Resolve unknown user names
     if (unknownUserIds.size > 0) {
-      try {
-        const resolveResult = await chrome.tabs.sendMessage(slackTab.id, {
-          type: 'resolve-users',
-          token: ws.token,
-          userIds: [...unknownUserIds]
-        });
-        if (resolveResult?.nameMap) {
-          for (const [uid, name] of Object.entries(resolveResult.nameMap)) {
-            userNameCache[uid] = name;
-            userNameCache[uid + '_ts'] = Date.now();
-          }
+      for (const userId of unknownUserIds) {
+        const result = await slackApi('users.info', ws.token, { user: userId });
+        if (result.ok) {
+          userNameCache[userId] = result.user?.profile?.display_name
+            || result.user?.profile?.real_name
+            || result.user?.name
+            || userId;
+          userNameCache[userId + '_ts'] = Date.now();
         }
-      } catch (e) {
-        console.warn('[Reactji] User resolution failed:', e.message);
       }
     }
 
@@ -251,26 +323,46 @@ async function pollAllWorkspaces() {
   // Trim recent reactions
   recentReactions = recentReactions.slice(0, MAX_RECENT_REACTIONS);
 
-  // Prune old known reactions
-  const pruneThreshold = Date.now() - PRUNE_AGE_DAYS * 86400000;
-  for (const teamId of Object.keys(workspaces)) {
-    const known = workspaces[teamId].knownReactions || {};
-    // We can't easily know message age from the key, so prune by count
-    const keys = Object.keys(known);
-    if (keys.length > 100) {
-      const toRemove = keys.slice(0, keys.length - 100);
-      for (const k of toRemove) delete known[k];
+  // Prune old notified reactions (older than 7 days)
+  const now = Date.now();
+  for (const key of Object.keys(notifiedReactions)) {
+    if (now - notifiedReactions[key] > PRUNE_AGE_MS) {
+      delete notifiedReactions[key];
     }
+  }
+
+  // Handle connection state transitions for disconnect notification
+  const isConnected = anySuccess;
+  if (!isConnected && wasConnected) {
+    // All workspaces failed — notify
+    const errorSummary = workspaceEntries.map(([, ws]) => ws.status).join(', ');
+    chrome.notifications.create('disconnected', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'Slack Reactji: Connection lost',
+      message: `Cannot reach Slack (${errorSummary}). Open app.slack.com to reconnect.`,
+      priority: 1
+    });
   }
 
   // Save state
   await chrome.storage.local.set({
-    workspaces,
+    workspaces: freshWorkspaces,
     recentReactions,
     userNameCache,
+    notifiedReactions,
     lastPollTime: Date.now(),
-    lastPollError: null
+    lastPollError: isConnected ? null : 'Poll failed for all workspaces',
+    wasConnected: isConnected
   });
+
+  // Clear error badge on success
+  if (isConnected) {
+    const currentBadge = await chrome.action.getBadgeText({});
+    if (currentBadge === '!') {
+      chrome.action.setBadgeText({ text: '' });
+    }
+  }
 
   // Send notifications for new reactions
   if (notificationsEnabled && newReactionCount > 0) {
@@ -304,7 +396,8 @@ async function getStatus() {
       teamId,
       teamName: ws.teamName,
       status: ws.status,
-      lastError: ws.lastError
+      lastError: ws.lastError,
+      hasToken: !!ws.token
     })),
     recentReactions: (data.recentReactions || []).slice(0, 20),
     settings: data.settings || { pollIntervalMinutes: DEFAULT_POLL_INTERVAL, notificationsEnabled: true, maxMessagesToCheck: 20 },
@@ -318,7 +411,6 @@ async function updateSettings(newSettings) {
   const merged = { ...current, ...newSettings };
   await chrome.storage.local.set({ settings: merged });
 
-  // Update alarm interval if changed
   if (newSettings.pollIntervalMinutes) {
     chrome.alarms.create(ALARM_NAME, { periodInMinutes: newSettings.pollIntervalMinutes });
   }

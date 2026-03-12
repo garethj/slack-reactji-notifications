@@ -87,7 +87,7 @@ body {
 
 .dot.connected { background: #2eb67d; }
 .dot.error, .dot.token-expired { background: #e01e5a; }
-.dot.no-tab { background: #ff9800; }
+.dot.no-cookie { background: #ff9800; }
 .dot.rate-limited { background: #ecb22e; }
 
 .workspace .name {

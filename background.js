@@ -208,10 +208,17 @@ async function pollAllWorkspaces() {
   let newReactionCount = 0;
 
   for (const [teamId, ws] of workspaceEntries) {
-    // Search for recent messages with reactions
+    // Search for recent messages from the user.
+    // We search for "from:me" without "has:reaction" because Slack's search
+    // index can lag behind for reaction metadata — a message that just received
+    // a reaction may not yet have has:reaction indexed.
+    // We also search by date range (last 7 days) rather than relying on sort
+    // order, since sorting by message timestamp misses old messages that received
+    // new reactions recently.
+    const afterDate = new Date(Date.now() - PRUNE_AGE_MS).toISOString().split('T')[0];
     const searchResult = await slackApi('search.messages', ws.token, {
-      query: 'has:reaction from:me',
-      count: String(maxMessages),
+      query: `from:me after:${afterDate}`,
+      count: String(Math.min(maxMessages * 5, 100)),
       sort: 'timestamp',
       sort_dir: 'desc'
     });

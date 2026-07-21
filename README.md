@@ -10,8 +10,8 @@ The extension piggybacks on the Slack web client's authentication. A content scr
 
 Every 2 minutes, it:
 
-1. Searches your recent messages that have reactions (`search.messages`)
-2. Fetches full reaction data for each (`reactions.get`)
+1. Searches all your recent messages (`search.messages`, `from:me`) rather than filtering by `has:reaction` — Slack's search index can lag 30+ minutes on reaction metadata, so a `has:reaction` filter would miss recently-reacted messages
+2. Fetches full reaction data for each (`reactions.get`), which is always up to date
 3. Diffs against a persistent "notified" set (not just "seen")
 4. Fires Chrome notifications for new reactions (which surface as macOS notifications)
 
